@@ -7,19 +7,51 @@ from torch_scatter import scatter_mean, scatter_sum, scatter_max
 from torch_scatter.utils import broadcast
 from collections import OrderedDict
 
+class Attention(nn.Module):
+    def __init__(self):
+        super(Attention, self).__init__()
+
+    def forward(self, entity_agg, user_emb):
+        # Assuming entity_agg and user_emb are of the same size
+        attention_scores = F.cosine_similarity(entity_agg, user_emb, dim=1)
+        attention_weights = F.softmax(attention_scores, dim=0)
+        attention_output = torch.matmul(attention_weights, entity_agg)
+        return attention_output
+
+
+class CFModule(nn.Module):
+    def __init__(self, n_users, n_items):
+        super(CFModule, self).__init__()
+
+    def forward(self, user_emb, interact_mat, weight):
+        mat_row = interact_mat._indices()[0, :]
+        mat_col = interact_mat._indices()[1, :]
+        item_neigh_emb = user_emb[mat_row] * weight[0]
+        i_u_agg = scatter_mean(src=item_neigh_emb, index=mat_col, dim_size=n_items, dim=0)
+
+        return i_u_agg
+
 class Aggregator(nn.Module):
     """
     Relational Path-aware Convolution Network
     """
-    def __init__(self, n_users, n_items, triplet_attention, use_gate):
+    def __init__(self, n_users, n_items, triplet_attention, use_gate, use_cf_module, use_attention):
         super(Aggregator, self).__init__()
         self.n_users = n_users
         self.n_items = n_items
         self.triplet_attention = triplet_attention
         self.use_gate = use_gate
+        self.use_cf_module = use_cf_module
+        self.use_attention = use_attention
+
         self.gate1 = nn.Linear(64, 64, bias=False)
         self.gate2 = nn.Linear(64, 64, bias=False)
         self.sigmoid = nn.Sigmoid()
+        if self.use_cf_module:
+            self.cf_module = CFModule(n_users, n_items)
+
+        if self.use_attention:
+            self.attention = Attention()
 
     def scatter_softmax(self, src, index, dim: int = -1, eps: float = 1e-12):
         if not torch.is_floating_point(src):
@@ -44,51 +76,52 @@ class Aggregator(nn.Module):
 
         head, tail = edge_index
         edge_relation_emb = weight[edge_type]
-        neigh_relation_emb = entity_emb[tail] * edge_relation_emb  # [-1, channel]
+        neigh_relation_emb = entity_emb[tail] * edge_relation_emb
         entity_agg = scatter_mean(src=neigh_relation_emb, index=head, dim_size=n_entities, dim=0)
 
         return entity_agg
+    def CF_forward(self, user_emb, interact_mat, weight):
+        mat_row = interact_mat._indices()[0, :]
+        mat_col = interact_mat._indices()[1, :]
+        mat_val = interact_mat._values()
 
-    def forward(self, entity_emb, user_emb, edge_index,
-                edge_type, interact_mat, weight, fast_weights=None, i=0):
-
+        item_neigh_emb = user_emb[mat_row] * weight[0]
+        i_u_agg = scatter_mean(src=item_neigh_emb, index=mat_col, dim_size=self.n_items, dim=0)
+    def forward(self, entity_emb, user_emb, edge_index, edge_type, interact_mat, weight, fast_weights=None, i=0):
         """KG aggregate"""
         entity_agg = self.KG_forward(entity_emb, edge_index, edge_type, weight)
 
         """user aggregate"""
-        if self.use_gate:
-            item_kg_agg = entity_agg[:self.n_items]
-            att_kg_agg = entity_agg[self.n_items:]
+        if self.use_cf_module:
+            i_u_agg = self.CF_forward(user_emb, interact_mat, weight)
 
-            mat_row = interact_mat._indices()[0, :]
-            mat_col = interact_mat._indices()[1, :]
-            mat_val = interact_mat._values()
-
-            item_neigh_emb = user_emb[mat_row] * weight[0]
-            i_u_agg = scatter_mean(src=item_neigh_emb, index=mat_col, dim_size=self.n_items, dim=0)
-
-            if fast_weights == None:
-                gi = self.sigmoid(self.gate1(item_kg_agg) + self.gate2(i_u_agg))
+            if fast_weights is None:
+                gi = self.sigmoid(self.gate1(entity_agg[:self.n_items]) + self.gate2(i_u_agg))
             else:
                 gate1_name = 'convs.{}.gate1.weight'.format(str(i))
                 gate2_name = 'convs.{}.gate2.weight'.format(str(i))
                 conv_w1 = fast_weights[gate1_name]
                 conv_w2 = fast_weights[gate2_name]
-                gi = self.sigmoid(F.linear(item_kg_agg, conv_w1) + F.linear(i_u_agg, conv_w2))
+                gi = self.sigmoid(F.linear(entity_agg[:self.n_items], conv_w1) + F.linear(i_u_agg, conv_w2))
 
-            item_emb_fusion = (gi * item_kg_agg) + ((1 - gi) * i_u_agg)
+            item_emb_fusion = (gi * entity_agg[:self.n_items]) + ((1 - gi) * i_u_agg)
             user_item_mat = torch.sparse.FloatTensor(torch.cat([mat_row, mat_col]).view(2, -1),
                                                      torch.ones_like(mat_val),
                                                      size=[self.n_users, self.n_items])
             user_agg = torch.sparse.mm(user_item_mat, item_emb_fusion)
 
-            entity_agg = torch.cat([item_emb_fusion, att_kg_agg])
+            entity_agg = torch.cat([item_emb_fusion, entity_agg[self.n_items:]])
         else:
             user_agg = torch.sparse.mm(interact_mat, entity_emb)
+
+        """Attention mechanism"""
+        if self.use_attention:
+            entity_agg = self.attention(entity_agg, user_emb)
 
         return entity_agg, user_agg
 
 
+        return i_u_agg
 class GraphConv(nn.Module):
     """
     Graph Convolutional Network
