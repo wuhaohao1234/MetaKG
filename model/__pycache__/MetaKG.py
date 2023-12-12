@@ -18,7 +18,7 @@ class Attention(nn.Module):
         return attention_output
 
 class CFModule(nn.Module):
-    def __init__(self, n_users, n_items):
+    def __init__(self):
         super(CFModule, self).__init__()
 
     def forward(self, user_emb, interact_mat, weight, n_items):
